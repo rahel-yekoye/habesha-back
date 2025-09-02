@@ -349,27 +349,60 @@ app.delete('/messages', authenticateToken, async (req, res) => {
 
 // Real-time Socket.IO connection
 const userIdToSocketId = {};
+const usernameToUserId = {}; // Map usernames to user IDs
+const socketIdToUserId = {}; // Map socket IDs to user IDs
 
 io.on('connection', (socket) => {
   console.log('A user connected:', socket.id);
 
-  socket.on('register_user', (userId) => {
+  socket.on('register_user', (userData) => {
+    let userId, username;
+    
+    // Handle both string (username) and object (userData) formats
+    if (typeof userData === 'string') {
+      username = userData;
+      userId = userData; // For backward compatibility, treat username as userId
+    } else if (userData && typeof userData === 'object') {
+      userId = userData.userId || userData.username;
+      username = userData.username || userData.userId;
+    } else {
+      console.log(`[SOCKET] Invalid user data format: ${userData}`);
+      return;
+    }
+    
     userIdToSocketId[userId] = socket.id;
+    usernameToUserId[username] = userId;
+    socketIdToUserId[socket.id] = userId;
     socket.data.userId = userId;
+    socket.data.username = username;
     socket.join(userId);
-    console.log(`[SOCKET] User ${userId} registered (socket.id: ${socket.id})`);
+    socket.join(username); // Also join username room for backward compatibility
+    
+    console.log(`[SOCKET] User ${username} (ID: ${userId}) registered (socket.id: ${socket.id})`);
     console.log(`[SOCKET] Current registered users:`, Object.keys(userIdToSocketId));
+    console.log(`[SOCKET] Username to UserID mapping:`, usernameToUserId);
     
     // Send test event to verify socket is working
-    socket.emit('test_event', { message: 'Socket connection verified', userId: userId });
+    socket.emit('test_event', { message: 'Socket connection verified', userId: userId, username: username });
+    
+
   });
 
   socket.on('disconnect', () => {
-    for (const [userId, sId] of Object.entries(userIdToSocketId)) {
-      if (sId === socket.id) {
-        delete userIdToSocketId[userId];
-        break;
+    const userId = socketIdToUserId[socket.id];
+    if (userId) {
+      delete userIdToSocketId[userId];
+      delete socketIdToUserId[socket.id];
+      
+      // Clean up username mapping
+      for (const [username, uid] of Object.entries(usernameToUserId)) {
+        if (uid === userId) {
+          delete usernameToUserId[username];
+          break;
+        }
       }
+      
+      console.log(`[SOCKET] User ${userId} disconnected, cleaned up mappings`);
     }
   });
 
@@ -747,9 +780,20 @@ app.put('/messages/mark-read', authenticateToken, async (req, res) => {
     console.log(`[CALL] Call initiated by ${data.from} to ${data.to}`);
     console.log(`[CALL] Data received:`, JSON.stringify(data, null, 2));
     console.log(`[CALL] Current registered users:`, Object.keys(userIdToSocketId));
-    console.log(`[CALL] Full userIdToSocketId mapping:`, userIdToSocketId);
-    const targetSocketId = userIdToSocketId[data.to];
-    console.log(`[CALL] Target socket ID for ${data.to}: ${targetSocketId}`);
+    console.log(`[CALL] Username to UserID mapping:`, usernameToUserId);
+    
+    // Try to find target by username first, then by userId
+    let targetSocketId = userIdToSocketId[data.to];
+    let targetUserId = data.to;
+    
+    if (!targetSocketId && usernameToUserId[data.to]) {
+      // If not found by userId, try username
+      targetUserId = usernameToUserId[data.to];
+      targetSocketId = userIdToSocketId[targetUserId];
+      console.log(`[CALL] Resolved username ${data.to} to userId ${targetUserId}`);
+    }
+    
+    console.log(`[CALL] Target socket ID for ${data.to} (userId: ${targetUserId}): ${targetSocketId}`);
     
     if (targetSocketId) {
       console.log(`[CALL] Emitting incoming_call to socket ${targetSocketId}`);
@@ -762,82 +806,175 @@ app.put('/messages/mark-read', authenticateToken, async (req, res) => {
     } else {
       console.log(`[CALL] No socket found for user ${data.to} - user may be offline`);
       console.log(`[CALL] Available users: ${Object.keys(userIdToSocketId).join(', ')}`);
+      console.log(`[CALL] Available usernames: ${Object.keys(usernameToUserId).join(', ')}`);
     }
   });
 
+
+
   socket.on('call_offer', (data) => {
-    console.log(`Call offer from ${data.from} to ${data.to}`);
-    const targetSocketId = userIdToSocketId[data.to];
+    console.log(`[CALL_OFFER] Call offer from ${data.from} to ${data.to}`);
+    console.log(`[CALL_OFFER] Data received:`, JSON.stringify(data, null, 2));
+    console.log(`[CALL_OFFER] Current registered users:`, Object.keys(userIdToSocketId));
+    console.log(`[CALL_OFFER] Username to UserID mapping:`, usernameToUserId);
+    
+    // Try to find target by username first, then by userId
+    let targetSocketId = userIdToSocketId[data.to];
+    let targetUserId = data.to;
+    
+    if (!targetSocketId && usernameToUserId[data.to]) {
+      targetUserId = usernameToUserId[data.to];
+      targetSocketId = userIdToSocketId[targetUserId];
+      console.log(`[CALL_OFFER] Resolved username ${data.to} to userId ${targetUserId}`);
+    }
+    
+    console.log(`[CALL_OFFER] Target socket ID for ${data.to} (userId: ${targetUserId}): ${targetSocketId}`);
+    
     if (targetSocketId) {
+      console.log(`[CALL_OFFER] Emitting call_offer to socket ${targetSocketId}`);
       io.to(targetSocketId).emit('call_offer', {
         from: data.from,
         offer: data.offer,
         callId: data.callId,
         isVideo: data.isVideo,
       });
+      console.log(`[CALL_OFFER] ✅ call_offer emitted successfully`);
+    } else {
+      console.log(`[CALL_OFFER] ❌ No socket found for user ${data.to} in call_offer`);
+      console.log(`[CALL_OFFER] Available users: ${Object.keys(userIdToSocketId).join(', ')}`);
+      console.log(`[CALL_OFFER] Available usernames: ${Object.keys(usernameToUserId).join(', ')}`);
     }
   });
 
   socket.on('call_answer', (data) => {
     console.log(`Call answer from ${data.from} to ${data.to}`);
-    const targetSocketId = userIdToSocketId[data.to];
+    
+    // Try to find target by username first, then by userId
+    let targetSocketId = userIdToSocketId[data.to];
+    if (!targetSocketId && usernameToUserId[data.to]) {
+      targetSocketId = userIdToSocketId[usernameToUserId[data.to]];
+      console.log(`[CALL] Resolved username ${data.to} to userId ${usernameToUserId[data.to]} for call_answer`);
+    }
+    
     if (targetSocketId) {
       io.to(targetSocketId).emit('call_answer', {
         from: data.from,
         answer: data.answer,
         callId: data.callId,
       });
+    } else {
+      console.log(`[CALL] No socket found for user ${data.to} in call_answer`);
     }
   });
 
+  // Handle call_answered event to stop caller from continuing to call
   socket.on('call_answered', (data) => {
-    console.log(`Call answered by ${data.from} for ${data.to}`);
-    const targetSocketId = userIdToSocketId[data.to];
+    console.log(`[SOCKET] call_answered: from=${data.from}, to=${data.to}`);
+    
+    // Clear call timer if it exists
+    const callKey = `${data.to}_${data.from}`; // Note: reversed for caller's timer
+    if (callTimers[callKey]) {
+      clearTimeout(callTimers[callKey]);
+      delete callTimers[callKey];
+      console.log(`[SOCKET] Cleared call timer for ${callKey}`);
+    }
+    
+    // Notify the caller that call was answered
+    let targetSocketId = userIdToSocketId[data.to];
+    if (!targetSocketId && usernameToUserId[data.to]) {
+      targetSocketId = userIdToSocketId[usernameToUserId[data.to]];
+      console.log(`[CALL] Resolved username ${data.to} to userId ${usernameToUserId[data.to]} for call_answered`);
+    }
+    
     if (targetSocketId) {
+      // First, notify the caller that call was answered
       io.to(targetSocketId).emit('call_answered', {
         from: data.from,
+        to: data.to,
         callId: data.callId,
       });
+      
+      // CRITICAL FIX: Tell the caller to start WebRTC offer process
+      console.log(`[SOCKET] ✅ Call answered, telling caller ${data.to} to start WebRTC offer`);
+      io.to(targetSocketId).emit('start_webrtc_offer', {
+        partnerId: data.from,  // The callee who answered
+        callId: data.callId,
+        message: 'Call was answered, start WebRTC offer process'
+      });
+    } else {
+      console.log(`[CALL] No socket found for user ${data.to} in call_answered`);
     }
   });
 
   socket.on('call_decline', (data) => {
     console.log(`Call declined by ${data.from} to ${data.to}`);
-    const targetSocketId = userIdToSocketId[data.to];
+    
+    // Try to find target by username first, then by userId
+    let targetSocketId = userIdToSocketId[data.to];
+    if (!targetSocketId && usernameToUserId[data.to]) {
+      targetSocketId = userIdToSocketId[usernameToUserId[data.to]];
+      console.log(`[CALL] Resolved username ${data.to} to userId ${usernameToUserId[data.to]} for call_decline`);
+    }
+    
     if (targetSocketId) {
       io.to(targetSocketId).emit('call_decline', {
         from: data.from,
         callId: data.callId,
       });
+    } else {
+      console.log(`[CALL] No socket found for user ${data.to} in call_decline`);
     }
   });
 
   socket.on('call_end', (data) => {
     console.log(`Call ended by ${data.from} for ${data.to}`);
-    const targetSocketId = userIdToSocketId[data.to];
+    
+    // Try to find target by username first, then by userId
+    let targetSocketId = userIdToSocketId[data.to];
+    if (!targetSocketId && usernameToUserId[data.to]) {
+      targetSocketId = userIdToSocketId[usernameToUserId[data.to]];
+      console.log(`[CALL] Resolved username ${data.to} to userId ${usernameToUserId[data.to]} for call_end`);
+    }
+    
     if (targetSocketId) {
       io.to(targetSocketId).emit('call_end', {
         from: data.from,
         callId: data.callId,
       });
+    } else {
+      console.log(`[CALL] No socket found for user ${data.to} in call_end`);
     }
   });
 
   // ICE candidates exchange
   socket.on('ice_candidate', (data) => {
-    const targetSocketId = userIdToSocketId[data.to];
+    // Try to find target by username first, then by userId
+    let targetSocketId = userIdToSocketId[data.to];
+    if (!targetSocketId && usernameToUserId[data.to]) {
+      targetSocketId = userIdToSocketId[usernameToUserId[data.to]];
+      console.log(`[CALL] Resolved username ${data.to} to userId ${usernameToUserId[data.to]} for ice_candidate`);
+    }
+    
     if (targetSocketId) {
       io.to(targetSocketId).emit('ice_candidate', {
         candidate: data.candidate,
         from: data.from,
       });
+    } else {
+      console.log(`[CALL] No socket found for user ${data.to} in ice_candidate`);
     }
   });
 
   
 
   socket.on('make_answer', (data) => {
-    const targetSocketId = userIdToSocketId[data.to];
+    // Try to find target by username first, then by userId
+    let targetSocketId = userIdToSocketId[data.to];
+    if (!targetSocketId && usernameToUserId[data.to]) {
+      targetSocketId = userIdToSocketId[usernameToUserId[data.to]];
+      console.log(`[CALL] Resolved username ${data.to} to userId ${usernameToUserId[data.to]} for make_answer`);
+    }
+    
     if (targetSocketId) {
       io.to(targetSocketId).emit('answer_made', {
         answer: data.answer,
@@ -849,22 +986,7 @@ app.put('/messages/mark-read', authenticateToken, async (req, res) => {
     }
   });
 
-  // Handle call_answered event to stop caller from continuing to call
-  socket.on('call_answered', (data) => {
-    console.log(`[SOCKET] call_answered: from=${data.from}, to=${data.to}`);
-    const callKey = `${data.to}_${data.from}`; // Note: reversed for caller's timer
-    if (callTimers[callKey]) {
-      clearTimeout(callTimers[callKey]);
-      delete callTimers[callKey];
-      console.log(`[SOCKET] Cleared call timer for ${callKey}`);
-    }
-    
-    // Notify the caller that call was answered
-    io.to(data.to).emit('call_answered', {
-      from: data.from,
-      to: data.to,
-    });
-  });
+
 
   // When a call ends after being answered
   function emitCallLog(callerId, calleeId, durationSeconds) {
@@ -902,11 +1024,26 @@ app.put('/messages/mark-read', authenticateToken, async (req, res) => {
     // Mark user online
     presence[userId] = { online: true, lastSeen: Date.now(), socketId: socket.id };
     io.emit('presence_update', { userId, online: true, lastSeen: presence[userId].lastSeen });
+    
+    // Also join username room if different from userId
+    const username = socket.data.username;
+    if (username && username !== userId) {
+      socket.join(username);
+      console.log(`[SOCKET] User ${userId} also joined username room: ${username}`);
+    }
   });
 
   socket.on('heartbeat', (userId) => {
     if (presence[userId]) {
       presence[userId].lastSeen = Date.now();
+      console.log(`[SOCKET] Heartbeat from ${userId} - lastSeen updated`);
+    } else {
+      // Try to find by username if not found by userId
+      const actualUserId = usernameToUserId[userId];
+      if (actualUserId && presence[actualUserId]) {
+        presence[actualUserId].lastSeen = Date.now();
+        console.log(`[SOCKET] Heartbeat from username ${userId} (userId: ${actualUserId}) - lastSeen updated`);
+      }
     }
   });
 
@@ -917,6 +1054,7 @@ app.put('/messages/mark-read', authenticateToken, async (req, res) => {
       const [uid] = entry;
       presence[uid] = { online: false, lastSeen: Date.now(), socketId: null };
       io.emit('presence_update', { userId: uid, online: false, lastSeen: presence[uid].lastSeen });
+      console.log(`[SOCKET] User ${uid} marked offline due to disconnect`);
     }
   });
 });
