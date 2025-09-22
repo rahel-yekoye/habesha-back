@@ -44,6 +44,20 @@ function normalizeRoomId(user1, user2) {
 // In-memory presence map: { [userId]: { online: boolean, lastSeen: number, socketId: string } }
 const presence = {};
 
+// Cleanup offline users every 30 seconds
+setInterval(() => {
+  const now = Date.now();
+  const offlineThreshold = 45000; // 45 seconds (3 missed heartbeats)
+  
+  Object.entries(presence).forEach(([userId, data]) => {
+    if (data.online && (now - data.lastSeen) > offlineThreshold) {
+      console.log(`[PRESENCE] Marking user ${userId} offline due to inactivity`);
+      presence[userId] = { ...data, online: false, lastSeen: now };
+      io.emit('presence_update', { userId, online: false, lastSeen: now });
+    }
+  });
+}, 30000);
+
 mongoose.connect(process.env.MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
@@ -409,7 +423,7 @@ io.on('connection', (socket) => {
   // Register user to their own room for signaling
 // Handle group message sending
 socket.on('send_group_message', async (data) => {
-  const { groupId, sender, content, clientId, fileUrl } = data;
+  const { groupId, sender, content, clientId, fileUrl, replyTo } = data;
   console.log('📥 Received send_group_message:', data);
 
   if (!groupId || !sender || (!content && !fileUrl)) {
@@ -426,6 +440,7 @@ socket.on('send_group_message', async (data) => {
       timestamp: new Date(),
       clientId: clientId || null,    // ✅ Save clientId
       fileUrl: fileUrl || '',        // ✅ Save fileUrl
+      replyTo: replyTo || null,      // ✅ Save replyTo field
     });
 
     await message.save();
@@ -439,6 +454,7 @@ socket.on('send_group_message', async (data) => {
       content: message.content,
       timestamp: message.timestamp,
       fileUrl: message.fileUrl,
+      replyTo: message.replyTo,           // ✅ Include replyTo in socket emission
     });
 
     console.log(`📤 Message emitted to group ${groupId}:`, {
@@ -1036,13 +1052,15 @@ app.put('/messages/mark-read', authenticateToken, async (req, res) => {
   socket.on('heartbeat', (userId) => {
     if (presence[userId]) {
       presence[userId].lastSeen = Date.now();
-      console.log(`[SOCKET] Heartbeat from ${userId} - lastSeen updated`);
+      presence[userId].online = true; // Ensure user stays online
+      console.log(`[SOCKET] Heartbeat from ${userId} - lastSeen updated, staying online`);
     } else {
       // Try to find by username if not found by userId
       const actualUserId = usernameToUserId[userId];
       if (actualUserId && presence[actualUserId]) {
         presence[actualUserId].lastSeen = Date.now();
-        console.log(`[SOCKET] Heartbeat from username ${userId} (userId: ${actualUserId}) - lastSeen updated`);
+        presence[actualUserId].online = true; // Ensure user stays online
+        console.log(`[SOCKET] Heartbeat from username ${userId} (userId: ${actualUserId}) - lastSeen updated, staying online`);
       }
     }
   });
@@ -1420,6 +1438,210 @@ app.get('/groups/:groupId/last-message', authenticateToken, async (req, res) => 
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// Add reaction to group message
+app.post('/groups/:groupId/messages/:messageId/react', authenticateToken, async (req, res) => {
+  try {
+    const { groupId, messageId } = req.params;
+    const { emoji, user } = req.body;
+
+    if (!emoji || !user) {
+      return res.status(400).json({ error: 'Emoji and user are required' });
+    }
+
+    // Find the message
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    // Check if user is member of the group
+    const group = await Group.findById(groupId);
+    if (!group || !group.members.includes(user)) {
+      return res.status(403).json({ error: 'Not authorized to react in this group' });
+    }
+
+    // Remove any existing reaction from this user, then add the new one
+    await Message.findByIdAndUpdate(
+      messageId,
+      { $pull: { reactions: { user } } }
+    );
+
+    const updated = await Message.findByIdAndUpdate(
+      messageId,
+      { $push: { reactions: { user, emoji } } },
+      { new: true }
+    );
+
+    res.status(200).json({ success: true, reactions: updated.reactions });
+  } catch (error) {
+    console.error('Error adding group message reaction:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove reaction from group message
+app.delete('/groups/:groupId/messages/:messageId/react', authenticateToken, async (req, res) => {
+  try {
+    const { groupId, messageId } = req.params;
+    const { emoji, user } = req.body;
+
+    if (!user) {
+      return res.status(400).json({ error: 'User is required' });
+    }
+
+    // Find the message
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    // Check if user is member of the group
+    const group = await Group.findById(groupId);
+    if (!group || !group.members.includes(user)) {
+      return res.status(403).json({ error: 'Not authorized to react in this group' });
+    }
+
+    // Remove the specific reaction
+    const updated = await Message.findByIdAndUpdate(
+      messageId,
+      { $pull: { reactions: { user, emoji } } },
+      { new: true }
+    );
+
+    res.status(200).json({ success: true, reactions: updated.reactions });
+  } catch (error) {
+    console.error('Error removing group message reaction:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT endpoint to edit group messages
+app.put('/groups/:groupId/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const { groupId, messageId } = req.params;
+    const { content } = req.body;
+
+    if (!content || content.trim() === '') {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+
+    // Find the message
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    // Check if message belongs to the group
+    if (message.groupId !== groupId) {
+      return res.status(400).json({ error: 'Message does not belong to this group' });
+    }
+
+    // Check if user is the sender of the message
+    console.log('🔍 Edit authorization check:');
+    console.log('  - Message sender:', message.sender);
+    console.log('  - Request user ID:', req.user.id);
+    console.log('  - Request user email:', req.user.email);
+    
+    // Find the user to get their username
+    const user = await User.findById(req.user.id);
+    const isMessageSender = message.sender === req.user.id || message.sender === user?.username;
+    
+    console.log('  - User username:', user?.username);
+    console.log('  - Is message sender:', isMessageSender);
+    
+    if (!isMessageSender) {
+      return res.status(403).json({ error: 'You can only edit your own messages' });
+    }
+
+    // Update the message
+    const updatedMessage = await Message.findByIdAndUpdate(
+      messageId,
+      { 
+        content: content.trim(),
+        edited: true,
+        editedAt: new Date()
+      },
+      { new: true }
+    );
+
+    // Emit socket event to update message in real-time
+    io.to(groupId).emit('group_message_edited', {
+      messageId,
+      newContent: content.trim(),
+      editedAt: updatedMessage.editedAt
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Message updated successfully',
+      data: updatedMessage 
+    });
+
+  } catch (error) {
+    console.error('Error editing group message:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE endpoint to delete group messages
+app.delete('/groups/:groupId/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const { groupId, messageId } = req.params;
+
+    // Find the message
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    // Check if message belongs to the group
+    if (message.groupId !== groupId) {
+      return res.status(400).json({ error: 'Message does not belong to this group' });
+    }
+
+    // Allow any group member to delete any message (like Telegram)
+    console.log('🔍 Delete authorization check:');
+    console.log('  - Message sender:', message.sender);
+    console.log('  - Request user ID:', req.user.id);
+    console.log('  - Request user email:', req.user.email);
+    
+    // Find the user to get their username
+    const user = await User.findById(req.user.id);
+    const group = await Group.findById(groupId);
+    
+    // Check if user is a member of the group
+    const isGroupMember = group && (group.members.includes(req.user.id) || group.members.includes(user?.username));
+    
+    console.log('  - User username:', user?.username);
+    console.log('  - Is group member:', isGroupMember);
+
+    if (!isGroupMember) {
+      return res.status(403).json({ error: 'You must be a group member to delete messages' });
+    }
+
+    // Delete the message
+    await Message.findByIdAndDelete(messageId);
+
+    // Emit socket event to remove message in real-time
+    console.log(`🔥 Emitting group_message_deleted to room ${groupId} for message ${messageId}`);
+    console.log(`📡 Clients in room ${groupId}:`, io.sockets.adapter.rooms.get(groupId));
+    io.to(groupId).emit('group_message_deleted', {
+      messageId
+    });
+    console.log('✅ Socket event emitted successfully');
+
+    res.json({ 
+      success: true, 
+      message: 'Message deleted successfully' 
+    });
+
+  } catch (error) {
+    console.error('Error deleting group message:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 /// DELETE /messages/:id  (or POST /messages/delete-many for batch delete)
 // Example using Express + MongoDB
 // Add a test route to verify server is reachable
