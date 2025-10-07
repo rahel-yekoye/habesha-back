@@ -41,22 +41,31 @@ function normalizeRoomId(user1, user2) {
   return user1 < user2 ? `${user1}_${user2}` : `${user2}_${user1}`;
 }
 
-// In-memory presence map: { [userId]: { online: boolean, lastSeen: number, socketId: string } }
+// In-memory presence map: { [userId]: { online: boolean, lastSeen: number, socketId: string, lastHeartbeat: number } }
 const presence = {};
 
-// Cleanup offline users every 30 seconds
+// Cleanup offline users every 2 minutes
 setInterval(() => {
   const now = Date.now();
-  const offlineThreshold = 45000; // 45 seconds (3 missed heartbeats)
+  const offlineThreshold = 120000; // 2 minutes (8 missed heartbeats)
   
   Object.entries(presence).forEach(([userId, data]) => {
-    if (data.online && (now - data.lastSeen) > offlineThreshold) {
+    if (data.online && (now - data.lastHeartbeat) > offlineThreshold) {
       console.log(`[PRESENCE] Marking user ${userId} offline due to inactivity`);
-      presence[userId] = { ...data, online: false, lastSeen: now };
-      io.emit('presence_update', { userId, online: false, lastSeen: now });
+      presence[userId] = { 
+        ...data, 
+        online: false, 
+        lastSeen: now,
+        lastHeartbeat: now // Update lastHeartbeat to prevent rapid toggling
+      };
+      io.emit('presence_update', { 
+        userId, 
+        online: false, 
+        lastSeen: now 
+      });
     }
   });
-}, 30000);
+}, 60000); // Check every minute instead of every 30 seconds
 
 mongoose.connect(process.env.MONGO_URI, {
   useNewUrlParser: true,
@@ -1036,10 +1045,27 @@ app.put('/messages/mark-read', authenticateToken, async (req, res) => {
   }
 
   socket.on('join', (userId) => {
+    const now = Date.now();
     socket.join(userId);
+    
     // Mark user online
-    presence[userId] = { online: true, lastSeen: Date.now(), socketId: socket.id };
-    io.emit('presence_update', { userId, online: true, lastSeen: presence[userId].lastSeen });
+    const wasOnline = presence[userId]?.online || false;
+    presence[userId] = { 
+      online: true, 
+      lastSeen: now, 
+      lastHeartbeat: now,
+      socketId: socket.id 
+    };
+    
+    // Only emit update if status changed
+    if (!wasOnline) {
+      console.log(`[PRESENCE] User ${userId} is now online`);
+      io.emit('presence_update', { 
+        userId, 
+        online: true, 
+        lastSeen: now 
+      });
+    }
     
     // Also join username room if different from userId
     const username = socket.data.username;
@@ -1048,20 +1074,47 @@ app.put('/messages/mark-read', authenticateToken, async (req, res) => {
       console.log(`[SOCKET] User ${userId} also joined username room: ${username}`);
     }
   });
-
-  socket.on('heartbeat', (userId) => {
-    if (presence[userId]) {
-      presence[userId].lastSeen = Date.now();
-      presence[userId].online = true; // Ensure user stays online
-      console.log(`[SOCKET] Heartbeat from ${userId} - lastSeen updated, staying online`);
+  
+  // Handle heartbeat to keep user online
+  socket.on('heartbeat', (data) => {
+    const now = Date.now();
+    let userId;
+    
+    // Handle both string (old) and object (new) heartbeat formats
+    if (typeof data === 'string') {
+      userId = data; // Old format
+    } else if (data && typeof data === 'object' && data.userId) {
+      userId = data.userId; // New format with timestamp
+      console.log(`[HEARTBEAT] Received from ${userId} at ${data.timestamp ? new Date(data.timestamp).toISOString() : 'no timestamp'}`);
     } else {
-      // Try to find by username if not found by userId
-      const actualUserId = usernameToUserId[userId];
-      if (actualUserId && presence[actualUserId]) {
-        presence[actualUserId].lastSeen = Date.now();
-        presence[actualUserId].online = true; // Ensure user stays online
-        console.log(`[SOCKET] Heartbeat from username ${userId} (userId: ${actualUserId}) - lastSeen updated, staying online`);
-      }
+      console.log('[HEARTBEAT] Invalid heartbeat data format:', data);
+      return;
+    }
+    
+    if (!userId) {
+      console.log('[HEARTBEAT] No user ID in heartbeat data');
+      return;
+    }
+    
+    const wasOnline = presence[userId]?.online || false;
+    
+    // Update presence with new heartbeat
+    presence[userId] = {
+      ...(presence[userId] || {}),
+      lastSeen: now,
+      lastHeartbeat: now,
+      online: true,
+      socketId: socket.id // Update socket ID in case of reconnection
+    };
+    
+    // Only emit update if status changed
+    if (!wasOnline) {
+      console.log(`[PRESENCE] User ${userId} is now online (from heartbeat)`);
+      io.emit('presence_update', { 
+        userId, 
+        online: true, 
+        lastSeen: now 
+      });
     }
   });
 
